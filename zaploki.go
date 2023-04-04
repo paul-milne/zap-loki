@@ -5,125 +5,201 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
 type ZapLoki interface {
-	Hook() func(zapcore.Entry, error)
+	Hook(e zapcore.Entry) error
+	Sink(u *url.URL) (zap.Sink, error)
 	Stop()
+	WithCreateLogger(zap.Config) (*zap.Logger, error)
 }
 
 type Config struct {
+	// Url of the loki server including http:// or https://
 	Url          string
 	BatchMaxSize int
 	BatchMaxWait time.Duration
+	// Labels that are added to all log lines,
+	// each label becomes a stream
+	Labels []string
+	// EnableLogLevelLabels adds a label with the log level to each log line,
+	// results in a stream for each log level
+	// EnableLogLevelLabels bool
 }
 
-type lokiHook struct {
+type lokiPusher struct {
 	config    *Config
 	ctx       context.Context
 	client    *http.Client
 	quit      chan struct{}
-	entries   chan *zapcore.Entry
+	entries   chan logEntry
 	waitGroup sync.WaitGroup
+	streams   map[string][][2]string
 }
 
 type lokiPushRequest struct {
-	Streams []*stream `json:"streams"`
+	Streams []streams `json:"streams"`
+}
+
+type streams struct {
+	Stream stream      `json:"stream"`
+	Values [][2]string `json:"values"`
 }
 
 type stream struct {
-	Stream map[string]string `json:"stream"`
-	Values [][2]string       `json:"values"`
+	Label string `json:"label"`
+}
+
+type logEntry struct {
+	Level     string  `json:"level"`
+	Timestamp float64 `json:"ts"`
+	Message   string  `json:"msg"`
+	Caller    string  `json:"caller"`
+	raw       string
 }
 
 func New(ctx context.Context, cfg Config) ZapLoki {
 	c := &http.Client{}
 
-	hook := &lokiHook{
+	cfg.Url = strings.TrimSuffix(cfg.Url, "/")
+	cfg.Url = fmt.Sprintf("%s/loki/api/v1/push", cfg.Url)
+
+	hook := &lokiPusher{
 		config:  &cfg,
 		ctx:     ctx,
 		client:  c,
 		quit:    make(chan struct{}),
-		entries: make(chan *zapcore.Entry),
+		entries: make(chan logEntry),
+		streams: make(map[string][][2]string),
 	}
+
+	for _, label := range cfg.Labels {
+		hook.streams[label] = [][2]string{}
+	}
+
+	// if cfg.EnableLogLevelLabels {
+	// 	hook.streams["level"] = ""
+	// }
 
 	hook.waitGroup.Add(1)
 	go hook.run()
 	return hook
 }
 
-func (z *lokiHook) Hook() func(zapcore.Entry, error) {
-
+func (lp *lokiPusher) Hook(e zapcore.Entry) error {
+	lp.entries <- logEntry{
+		Level:     e.Level.String(),
+		Timestamp: float64(e.Time.UnixNano()),
+		Message:   e.Message,
+		Caller:    e.Caller.TrimmedPath(),
+	}
 	return nil
 }
 
-func (z *lokiHook) Stop() {
-	close(z.quit)
-	z.waitGroup.Wait()
+func (lp *lokiPusher) Sink(u *url.URL) (zap.Sink, error) {
+	return newSink(lp), nil
 }
 
-func (z *lokiHook) run() {
-	var batch []*zapcore.Entry
-	ticker := time.NewTimer(z.config.BatchMaxWait)
+func (lp *lokiPusher) Stop() {
+	close(lp.quit)
+	lp.waitGroup.Wait()
+}
+
+func (lp *lokiPusher) WithCreateLogger(cfg zap.Config) (*zap.Logger, error) {
+	err := zap.RegisterSink(lokiSinkKey, lp.Sink)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fullSinkKey := fmt.Sprintf("%s://", lokiSinkKey)
+
+	if cfg.OutputPaths == nil {
+		cfg.OutputPaths = []string{fullSinkKey}
+	} else {
+		cfg.OutputPaths = append(cfg.OutputPaths, fullSinkKey)
+	}
+
+	return cfg.Build()
+}
+
+func (lp *lokiPusher) run() {
+	var batch []logEntry
+	ticker := time.NewTimer(lp.config.BatchMaxWait)
 
 	defer func() {
 		if len(batch) > 0 {
-			z.send(batch)
+			lp.send(batch)
 		}
 
-		z.waitGroup.Done()
+		lp.waitGroup.Done()
 	}()
 
 	for {
 		select {
-		case <-z.ctx.Done():
+		case <-lp.ctx.Done():
 			return
-		case <-z.quit:
+		case <-lp.quit:
 			return
-		case entry := <-z.entries:
+		case entry := <-lp.entries:
 			batch = append(batch, entry)
-			if len(batch) >= z.config.BatchMaxSize {
-				z.send(batch)
-				batch = make([]*zapcore.Entry, 0)
-				ticker.Reset(z.config.BatchMaxWait)
+			if len(batch) >= lp.config.BatchMaxSize {
+				lp.send(batch)
+				batch = make([]logEntry, 0)
+				ticker.Reset(lp.config.BatchMaxWait)
 			}
 		case <-ticker.C:
 			if len(batch) > 0 {
-				z.send(batch)
-				batch = make([]*zapcore.Entry, 0)
+				lp.send(batch)
+				batch = make([]logEntry, 0)
 			}
-			ticker.Reset(z.config.BatchMaxWait)
+			ticker.Reset(lp.config.BatchMaxWait)
 		}
 	}
 }
 
-func (z *lokiHook) send(batch []*zapcore.Entry) error {
-	var streams []*stream
-	streams = append(streams, &stream{
-		Stream: map[string]string{},
-		Values: make([][2]string, 0),
-	})
-	data := lokiPushRequest{
-		Streams: streams,
+func (lp *lokiPusher) send(batch []logEntry) error {
+	data := lokiPushRequest{}
+
+	for _, entry := range batch {
+		v := [2]string{fmt.Sprint(entry.Timestamp), entry.raw}
+		for stream, logs := range lp.streams {
+			logs = append(logs, v)
+			lp.streams[stream] = logs
+		}
 	}
+
+	for label, values := range lp.streams {
+		s := streams{
+			Stream: stream{
+				Label: label,
+			},
+			Values: values,
+		}
+		data.Streams = append(data.Streams, s)
+	}
+
 	msg, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal json: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", z.config.Url, bytes.NewBuffer(msg))
+	req, err := http.NewRequest("POST", lp.config.Url, bytes.NewBuffer(msg))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := z.client.Do(req)
+	resp, err := lp.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send request: %w", err)
 	}
