@@ -34,6 +34,8 @@ type Config struct {
 	// EnableLogLevelLabels adds a label with the log level to each log line,
 	// results in a stream for each log level
 	// EnableLogLevelLabels bool
+	Username string
+	Password string
 }
 
 type lokiPusher struct {
@@ -199,12 +201,20 @@ func (lp *lokiPusher) send(batch []logEntry) error {
 
 	req.Header.Set("Content-Type", "application/json")
 
+	if lp.config.Username != "" && lp.config.Password != "" {
+		req.SetBasicAuth(lp.config.Username, lp.config.Password)
+	}
+
 	resp, err := lp.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send request: %w", err)
 	}
 
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to send request: %s", resp.Status)
+	}
 
 	return nil
 }
