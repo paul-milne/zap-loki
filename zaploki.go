@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,7 +31,7 @@ type Config struct {
 	BatchMaxWait time.Duration
 	// Labels that are added to all log lines,
 	// each label becomes a stream
-	Labels []string
+	Labels map[string]string
 	// EnableLogLevelLabels adds a label with the log level to each log line,
 	// results in a stream for each log level
 	// EnableLogLevelLabels bool
@@ -45,7 +46,7 @@ type lokiPusher struct {
 	quit      chan struct{}
 	entries   chan logEntry
 	waitGroup sync.WaitGroup
-	streams   map[string][][2]string
+	streams   map[string]streamEntries
 }
 
 type lokiPushRequest struct {
@@ -53,20 +54,22 @@ type lokiPushRequest struct {
 }
 
 type streams struct {
-	Stream stream      `json:"stream"`
-	Values [][2]string `json:"values"`
+	Stream map[string]string `json:"stream"`
+	Values [][2]string       `json:"values"`
 }
 
-type stream struct {
-	Label string `json:"label"`
+type streamEntries struct {
+	label string
+	logs  [][2]string
 }
 
 type logEntry struct {
-	Level     string  `json:"level"`
-	Timestamp float64 `json:"ts"`
-	Message   string  `json:"msg"`
-	Caller    string  `json:"caller"`
-	raw       string
+	Level        string  `json:"level"`
+	ZapTimestamp float64 `json:"ts"`
+	Message      string  `json:"msg"`
+	Caller       string  `json:"caller"`
+	raw          string
+	timestamp    time.Time
 }
 
 func New(ctx context.Context, cfg Config) ZapLoki {
@@ -81,11 +84,14 @@ func New(ctx context.Context, cfg Config) ZapLoki {
 		client:  c,
 		quit:    make(chan struct{}),
 		entries: make(chan logEntry),
-		streams: make(map[string][][2]string),
+		streams: make(map[string]streamEntries),
 	}
 
-	for _, label := range cfg.Labels {
-		hook.streams[label] = [][2]string{}
+	for id, label := range cfg.Labels {
+		hook.streams[id] = streamEntries{
+			label: label,
+			logs:  [][2]string{},
+		}
 	}
 
 	// if cfg.EnableLogLevelLabels {
@@ -99,10 +105,11 @@ func New(ctx context.Context, cfg Config) ZapLoki {
 
 func (lp *lokiPusher) Hook(e zapcore.Entry) error {
 	lp.entries <- logEntry{
-		Level:     e.Level.String(),
-		Timestamp: float64(e.Time.UnixNano()),
-		Message:   e.Message,
-		Caller:    e.Caller.TrimmedPath(),
+		Level:        e.Level.String(),
+		ZapTimestamp: float64(e.Time.UnixMilli()),
+		Message:      e.Message,
+		Caller:       e.Caller.TrimmedPath(),
+		timestamp:    time.Now(),
 	}
 	return nil
 }
@@ -172,19 +179,17 @@ func (lp *lokiPusher) send(batch []logEntry) error {
 	data := lokiPushRequest{}
 
 	for _, entry := range batch {
-		v := [2]string{fmt.Sprint(entry.Timestamp), entry.raw}
-		for stream, logs := range lp.streams {
-			logs = append(logs, v)
-			lp.streams[stream] = logs
+		v := [2]string{strconv.FormatInt(entry.timestamp.UnixNano(), 10), entry.raw}
+		for stream, streamEntries := range lp.streams {
+			streamEntries.logs = append(streamEntries.logs, v)
+			lp.streams[stream] = streamEntries
 		}
 	}
 
-	for label, values := range lp.streams {
+	for id, values := range lp.streams {
 		s := streams{
-			Stream: stream{
-				Label: label,
-			},
-			Values: values,
+			Stream: map[string]string{id: values.label},
+			Values: values.logs,
 		}
 		data.Streams = append(data.Streams, s)
 	}
@@ -212,7 +217,7 @@ func (lp *lokiPusher) send(batch []logEntry) error {
 
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if 199 < resp.StatusCode && resp.StatusCode < 300 {
 		return fmt.Errorf("failed to send request: %s", resp.Status)
 	}
 

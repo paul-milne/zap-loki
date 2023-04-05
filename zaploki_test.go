@@ -13,7 +13,7 @@ func TestNew(t *testing.T) {
 		Url:          "http://localhost:3100",
 		BatchMaxSize: 100,
 		BatchMaxWait: 10 * time.Second,
-		Labels:       []string{"app=app1", "env=dev"},
+		Labels:       map[string]string{"app": "test", "env": "dev"},
 	})
 	logger, err := v.WithCreateLogger(zap.NewProductionConfig())
 	if err != nil {
