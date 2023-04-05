@@ -2,7 +2,6 @@ package zaploki
 
 import (
 	"encoding/json"
-	"time"
 )
 
 const lokiSinkKey = "loki"
@@ -35,7 +34,6 @@ func (s sink) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	entry.raw = string(p)
-	entry.timestamp = time.Now()
 	s.lokiPusher.entries <- entry
 	return len(p), nil
 }

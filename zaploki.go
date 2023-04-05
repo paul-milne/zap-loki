@@ -64,12 +64,11 @@ type streamEntries struct {
 }
 
 type logEntry struct {
-	Level        string  `json:"level"`
-	ZapTimestamp float64 `json:"ts"`
-	Message      string  `json:"msg"`
-	Caller       string  `json:"caller"`
-	raw          string
-	timestamp    time.Time
+	Level     string  `json:"level"`
+	Timestamp float64 `json:"ts"`
+	Message   string  `json:"msg"`
+	Caller    string  `json:"caller"`
+	raw       string
 }
 
 func New(ctx context.Context, cfg Config) ZapLoki {
@@ -105,11 +104,10 @@ func New(ctx context.Context, cfg Config) ZapLoki {
 
 func (lp *lokiPusher) Hook(e zapcore.Entry) error {
 	lp.entries <- logEntry{
-		Level:        e.Level.String(),
-		ZapTimestamp: float64(e.Time.UnixMilli()),
-		Message:      e.Message,
-		Caller:       e.Caller.TrimmedPath(),
-		timestamp:    time.Now(),
+		Level:     e.Level.String(),
+		Timestamp: float64(e.Time.UnixMilli()),
+		Message:   e.Message,
+		Caller:    e.Caller.TrimmedPath(),
 	}
 	return nil
 }
@@ -179,7 +177,8 @@ func (lp *lokiPusher) send(batch []logEntry) error {
 	data := lokiPushRequest{}
 
 	for _, entry := range batch {
-		v := [2]string{strconv.FormatInt(entry.timestamp.UnixNano(), 10), entry.raw}
+		ts := time.Unix(int64(entry.Timestamp), 0)
+		v := [2]string{strconv.FormatInt(ts.UnixNano(), 10), entry.raw}
 		for stream, streamEntries := range lp.streams {
 			streamEntries.logs = append(streamEntries.logs, v)
 			lp.streams[stream] = streamEntries
