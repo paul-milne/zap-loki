@@ -28,7 +28,6 @@ func (s sink) Close() error { return nil }
 
 func (s sink) Write(p []byte) (int, error) {
 	var entry logEntry
-	// _, err := marshmallow.Unmarshal(p, &entry)
 	err := json.Unmarshal(p, &entry)
 	if err != nil {
 		return 0, err
