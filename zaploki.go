@@ -26,15 +26,14 @@ type ZapLoki interface {
 
 type Config struct {
 	// Url of the loki server including http:// or https://
-	Url          string
+	Url string
+	// BatchMaxSize is the maximum number of log lines that are sent in one request
 	BatchMaxSize int
+	// BatchMaxWait is the maximum time to wait before sending a request
 	BatchMaxWait time.Duration
 	// Labels that are added to all log lines,
 	// each label becomes a stream
-	Labels map[string]string
-	// EnableLogLevelLabels adds a label with the log level to each log line,
-	// results in a stream for each log level
-	// EnableLogLevelLabels bool
+	Labels   map[string]string
 	Username string
 	Password string
 }
@@ -77,7 +76,7 @@ func New(ctx context.Context, cfg Config) ZapLoki {
 	cfg.Url = strings.TrimSuffix(cfg.Url, "/")
 	cfg.Url = fmt.Sprintf("%s/loki/api/v1/push", cfg.Url)
 
-	hook := &lokiPusher{
+	pusher := &lokiPusher{
 		config:  &cfg,
 		ctx:     ctx,
 		client:  c,
@@ -87,21 +86,18 @@ func New(ctx context.Context, cfg Config) ZapLoki {
 	}
 
 	for id, label := range cfg.Labels {
-		hook.streams[id] = streamEntries{
+		pusher.streams[id] = streamEntries{
 			label: label,
 			logs:  [][2]string{},
 		}
 	}
 
-	// if cfg.EnableLogLevelLabels {
-	// 	hook.streams["level"] = ""
-	// }
-
-	hook.waitGroup.Add(1)
-	go hook.run()
-	return hook
+	pusher.waitGroup.Add(1)
+	go pusher.run()
+	return pusher
 }
 
+// Hook is a function that can be used as a zap hook to write log lines to loki
 func (lp *lokiPusher) Hook(e zapcore.Entry) error {
 	lp.entries <- logEntry{
 		Level:     e.Level.String(),
@@ -112,15 +108,18 @@ func (lp *lokiPusher) Hook(e zapcore.Entry) error {
 	return nil
 }
 
-func (lp *lokiPusher) Sink(u *url.URL) (zap.Sink, error) {
+// Sink returns a new loki zap sink
+func (lp *lokiPusher) Sink(_ *url.URL) (zap.Sink, error) {
 	return newSink(lp), nil
 }
 
+// Stop stops the loki pusher
 func (lp *lokiPusher) Stop() {
 	close(lp.quit)
 	lp.waitGroup.Wait()
 }
 
+// WithCreateLogger creates a new zap logger with a loki sink from a zap config
 func (lp *lokiPusher) WithCreateLogger(cfg zap.Config) (*zap.Logger, error) {
 	err := zap.RegisterSink(lokiSinkKey, lp.Sink)
 	if err != nil {
