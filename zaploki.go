@@ -2,6 +2,7 @@ package zaploki
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -197,12 +198,19 @@ func (lp *lokiPusher) send(batch []logEntry) error {
 		return fmt.Errorf("failed to marshal json: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", lp.config.Url, bytes.NewBuffer(msg))
+	var buf bytes.Buffer
+	g := gzip.NewWriter(&buf)
+	if _, err := g.Write(msg); err != nil {
+		return fmt.Errorf("failed to gzip json: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", lp.config.Url, &buf)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
 
 	if lp.config.Username != "" && lp.config.Password != "" {
 		req.SetBasicAuth(lp.config.Username, lp.config.Password)
