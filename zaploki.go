@@ -203,6 +203,9 @@ func (lp *lokiPusher) send(batch []logEntry) error {
 	if _, err := g.Write(msg); err != nil {
 		return fmt.Errorf("failed to gzip json: %w", err)
 	}
+	if err := g.Close(); err != nil {
+		return fmt.Errorf("failed to close gzip writer: %w", err)
+	}
 
 	req, err := http.NewRequest("POST", lp.config.Url, &buf)
 	if err != nil {
@@ -223,8 +226,8 @@ func (lp *lokiPusher) send(batch []logEntry) error {
 
 	defer resp.Body.Close()
 
-	if 199 < resp.StatusCode && resp.StatusCode < 300 {
-		return fmt.Errorf("failed to send request: %s", resp.Status)
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("recieved unexpected response code from Loki: %s", resp.Status)
 	}
 
 	return nil
