@@ -32,8 +32,7 @@ type Config struct {
 	BatchMaxSize int
 	// BatchMaxWait is the maximum time to wait before sending a request
 	BatchMaxWait time.Duration
-	// Labels that are added to all log lines,
-	// each label becomes a stream
+	// Labels that are added to all log lines
 	Labels   map[string]string
 	Username string
 	Password string
@@ -46,21 +45,15 @@ type lokiPusher struct {
 	quit      chan struct{}
 	entries   chan logEntry
 	waitGroup sync.WaitGroup
-	streams   map[string]streamEntries
 }
 
 type lokiPushRequest struct {
-	Streams []streams `json:"streams"`
+	Streams []stream `json:"streams"`
 }
 
-type streams struct {
+type stream struct {
 	Stream map[string]string `json:"stream"`
 	Values [][2]string       `json:"values"`
-}
-
-type streamEntries struct {
-	label string
-	logs  [][2]string
 }
 
 type logEntry struct {
@@ -83,14 +76,6 @@ func New(ctx context.Context, cfg Config) ZapLoki {
 		client:  c,
 		quit:    make(chan struct{}),
 		entries: make(chan logEntry),
-		streams: make(map[string]streamEntries),
-	}
-
-	for id, label := range cfg.Labels {
-		pusher.streams[id] = streamEntries{
-			label: label,
-			logs:  [][2]string{},
-		}
 	}
 
 	pusher.waitGroup.Add(1)
@@ -176,22 +161,17 @@ func (lp *lokiPusher) run() {
 func (lp *lokiPusher) send(batch []logEntry) error {
 	data := lokiPushRequest{}
 
+	var logs [][2]string
 	for _, entry := range batch {
 		ts := time.Unix(int64(entry.Timestamp), 0)
 		v := [2]string{strconv.FormatInt(ts.UnixNano(), 10), entry.raw}
-		for stream, streamEntries := range lp.streams {
-			streamEntries.logs = append(streamEntries.logs, v)
-			lp.streams[stream] = streamEntries
-		}
+		logs = append(logs, v)
 	}
 
-	for id, values := range lp.streams {
-		s := streams{
-			Stream: map[string]string{id: values.label},
-			Values: values.logs,
-		}
-		data.Streams = append(data.Streams, s)
-	}
+	data.Streams = append(data.Streams, stream{
+		Stream: lp.config.Labels,
+		Values: logs,
+	})
 
 	msg, err := json.Marshal(data)
 	if err != nil {
