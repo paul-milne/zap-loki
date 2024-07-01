@@ -23,8 +23,16 @@ func newSink(lp *lokiPusher) lokiSink {
 	}
 }
 
-func (s sink) Sync() error  { return nil }
-func (s sink) Close() error { return nil }
+func (s sink) Sync() error {
+	if len(s.lokiPusher.logsBatch) > 0 {
+		return s.lokiPusher.send()
+	}
+	return nil
+}
+func (s sink) Close() error {
+	s.lokiPusher.Stop()
+	return nil
+}
 
 func (s sink) Write(p []byte) (int, error) {
 	var entry logEntry
@@ -33,6 +41,6 @@ func (s sink) Write(p []byte) (int, error) {
 		return 0, err
 	}
 	entry.raw = string(p)
-	s.lokiPusher.entries <- entry
+	s.lokiPusher.entry <- entry
 	return len(p), nil
 }

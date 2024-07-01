@@ -41,10 +41,12 @@ type Config struct {
 type lokiPusher struct {
 	config    *Config
 	ctx       context.Context
+	cancel    context.CancelFunc
 	client    *http.Client
 	quit      chan struct{}
-	entries   chan logEntry
+	entry     chan logEntry
 	waitGroup sync.WaitGroup
+	logsBatch []streamValue
 }
 
 type lokiPushRequest struct {
@@ -53,8 +55,10 @@ type lokiPushRequest struct {
 
 type stream struct {
 	Stream map[string]string `json:"stream"`
-	Values [][2]string       `json:"values"`
+	Values []streamValue     `json:"values"`
 }
+
+type streamValue []string
 
 type logEntry struct {
 	Level     string  `json:"level"`
@@ -65,27 +69,27 @@ type logEntry struct {
 }
 
 func New(ctx context.Context, cfg Config) ZapLoki {
-	c := &http.Client{}
+	cfg.Url = fmt.Sprintf("%s/loki/api/v1/push", strings.TrimSuffix(cfg.Url, "/"))
 
-	cfg.Url = strings.TrimSuffix(cfg.Url, "/")
-	cfg.Url = fmt.Sprintf("%s/loki/api/v1/push", cfg.Url)
-
-	pusher := &lokiPusher{
-		config:  &cfg,
-		ctx:     ctx,
-		client:  c,
-		quit:    make(chan struct{}),
-		entries: make(chan logEntry),
+	ctx, cancel := context.WithCancel(ctx)
+	lp := &lokiPusher{
+		config:    &cfg,
+		ctx:       ctx,
+		cancel:    cancel,
+		client:    &http.Client{},
+		quit:      make(chan struct{}),
+		entry:     make(chan logEntry),
+		logsBatch: make([]streamValue, 0, cfg.BatchMaxSize),
 	}
 
-	pusher.waitGroup.Add(1)
-	go pusher.run()
-	return pusher
+	lp.waitGroup.Add(1)
+	go lp.run()
+	return lp
 }
 
 // Hook is a function that can be used as a zap hook to write log lines to loki
 func (lp *lokiPusher) Hook(e zapcore.Entry) error {
-	lp.entries <- logEntry{
+	lp.entry <- logEntry{
 		Level:     e.Level.String(),
 		Timestamp: float64(e.Time.UnixMilli()),
 		Message:   e.Message,
@@ -103,6 +107,7 @@ func (lp *lokiPusher) Sink(_ *url.URL) (zap.Sink, error) {
 func (lp *lokiPusher) Stop() {
 	close(lp.quit)
 	lp.waitGroup.Wait()
+	lp.cancel()
 }
 
 // WithCreateLogger creates a new zap logger with a loki sink from a zap config
@@ -124,12 +129,12 @@ func (lp *lokiPusher) WithCreateLogger(cfg zap.Config) (*zap.Logger, error) {
 }
 
 func (lp *lokiPusher) run() {
-	var batch []logEntry
 	ticker := time.NewTimer(lp.config.BatchMaxWait)
+	defer ticker.Stop()
 
 	defer func() {
-		if len(batch) > 0 {
-			lp.send(batch)
+		if len(lp.logsBatch) > 0 {
+			lp.send()
 		}
 
 		lp.waitGroup.Done()
@@ -141,59 +146,49 @@ func (lp *lokiPusher) run() {
 			return
 		case <-lp.quit:
 			return
-		case entry := <-lp.entries:
-			batch = append(batch, entry)
-			if len(batch) >= lp.config.BatchMaxSize {
-				lp.send(batch)
-				batch = make([]logEntry, 0)
-				ticker.Reset(lp.config.BatchMaxWait)
+		case entry := <-lp.entry:
+			lp.logsBatch = append(lp.logsBatch, newLog(entry))
+			if len(lp.logsBatch) >= lp.config.BatchMaxSize {
+				_ = lp.send()
+				lp.logsBatch = lp.logsBatch[:0]
 			}
 		case <-ticker.C:
-			if len(batch) > 0 {
-				lp.send(batch)
-				batch = make([]logEntry, 0)
+			if len(lp.logsBatch) > 0 {
+				_ = lp.send()
+				lp.logsBatch = lp.logsBatch[:0]
 			}
-			ticker.Reset(lp.config.BatchMaxWait)
 		}
 	}
 }
 
-func (lp *lokiPusher) send(batch []logEntry) error {
-	data := lokiPushRequest{}
+func newLog(entry logEntry) streamValue {
+	ts := time.Unix(int64(entry.Timestamp), 0)
+	return []string{strconv.FormatInt(ts.UnixNano(), 10), entry.raw}
+}
 
-	var logs [][2]string
-	for _, entry := range batch {
-		ts := time.Unix(int64(entry.Timestamp), 0)
-		v := [2]string{strconv.FormatInt(ts.UnixNano(), 10), entry.raw}
-		logs = append(logs, v)
-	}
+func (lp *lokiPusher) send() error {
+	buf := bytes.NewBuffer([]byte{})
+	gz := gzip.NewWriter(buf)
 
-	data.Streams = append(data.Streams, stream{
+	if err := json.NewEncoder(gz).Encode(lokiPushRequest{Streams: []stream{{
 		Stream: lp.config.Labels,
-		Values: logs,
-	})
-
-	msg, err := json.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("failed to marshal json: %w", err)
+		Values: lp.logsBatch,
+	}}}); err != nil {
+		return err
 	}
 
-	var buf bytes.Buffer
-	g := gzip.NewWriter(&buf)
-	if _, err := g.Write(msg); err != nil {
-		return fmt.Errorf("failed to gzip json: %w", err)
-	}
-	if err := g.Close(); err != nil {
-		return fmt.Errorf("failed to close gzip writer: %w", err)
+	if err := gz.Close(); err != nil {
+		return err
 	}
 
-	req, err := http.NewRequest("POST", lp.config.Url, &buf)
+	req, err := http.NewRequest(http.MethodPost, lp.config.Url, buf)
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Content-Encoding", "gzip")
+	req.WithContext(lp.ctx)
 
 	if lp.config.Username != "" && lp.config.Password != "" {
 		req.SetBasicAuth(lp.config.Username, lp.config.Password)
