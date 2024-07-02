@@ -134,7 +134,7 @@ func (lp *lokiPusher) run() {
 
 	defer func() {
 		if len(lp.logsBatch) > 0 {
-			lp.send()
+			_ = lp.send()
 		}
 
 		lp.waitGroup.Done()
