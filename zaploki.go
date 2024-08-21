@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,6 +74,7 @@ func New(ctx context.Context, cfg Config) ZapLoki {
 	cfg.Url = fmt.Sprintf("%s/loki/api/v1/push", strings.TrimSuffix(cfg.Url, "/"))
 
 	ctx, cancel := context.WithCancel(ctx)
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	lp := &lokiPusher{
 		config:    &cfg,
 		ctx:       ctx,
@@ -134,7 +137,10 @@ func (lp *lokiPusher) run() {
 
 	defer func() {
 		if len(lp.logsBatch) > 0 {
-			_ = lp.send()
+			err := lp.send()
+			if err != nil {
+				slog.Error("failed to send logs", slog.Any("error", err))
+			}
 		}
 
 		lp.waitGroup.Done()
@@ -149,12 +155,18 @@ func (lp *lokiPusher) run() {
 		case entry := <-lp.entry:
 			lp.logsBatch = append(lp.logsBatch, newLog(entry))
 			if len(lp.logsBatch) >= lp.config.BatchMaxSize {
-				_ = lp.send()
+				err := lp.send()
+				if err != nil {
+					slog.Error("failed to send logs", slog.Any("error", err))
+				}
 				lp.logsBatch = lp.logsBatch[:0]
 			}
 		case <-ticker.C:
 			if len(lp.logsBatch) > 0 {
-				_ = lp.send()
+				err := lp.send()
+				if err != nil {
+					slog.Error("failed to send logs", slog.Any("error", err))
+				}
 				lp.logsBatch = lp.logsBatch[:0]
 			}
 		}
