@@ -132,7 +132,7 @@ func (lp *lokiPusher) WithCreateLogger(cfg zap.Config) (*zap.Logger, error) {
 }
 
 func (lp *lokiPusher) run() {
-	ticker := time.NewTimer(lp.config.BatchMaxWait)
+	ticker := time.NewTicker(lp.config.BatchMaxWait)
 	defer ticker.Stop()
 
 	defer func() {
