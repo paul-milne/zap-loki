@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 )
 
-const lokiSinkKey = "loki"
-
 type lokiSink interface {
 	Sync() error
 	Close() error

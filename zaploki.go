@@ -28,6 +28,8 @@ type ZapLoki interface {
 }
 
 type Config struct {
+	// SinkKey is the key that is used to register the sink with zap
+	SinkKey string
 	// Url of the loki server including http:// or https://
 	Url string
 	// BatchMaxSize is the maximum number of log lines that are sent in one request
@@ -115,12 +117,15 @@ func (lp *lokiPusher) Stop() {
 
 // WithCreateLogger creates a new zap logger with a loki sink from a zap config
 func (lp *lokiPusher) WithCreateLogger(cfg zap.Config) (*zap.Logger, error) {
-	err := zap.RegisterSink(lokiSinkKey, lp.Sink)
+	if lp.config.SinkKey == "" {
+		lp.config.SinkKey = "loki"
+	}
+	err := zap.RegisterSink(lp.config.SinkKey, lp.Sink)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fullSinkKey := fmt.Sprintf("%s://", lokiSinkKey)
+	fullSinkKey := fmt.Sprintf("%s://", lp.config.SinkKey)
 
 	if cfg.OutputPaths == nil {
 		cfg.OutputPaths = []string{fullSinkKey}
