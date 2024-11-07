@@ -28,6 +28,8 @@ type ZapLoki interface {
 }
 
 type Config struct {
+	TenantValue string
+	TenantKey   string
 	// SinkKey is the key that is used to register the sink with zap
 	SinkKey string
 	// Url of the loki server including http:// or https://
@@ -205,6 +207,10 @@ func (lp *lokiPusher) send() error {
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Content-Encoding", "gzip")
+
+	if len(lp.config.TenantKey) > 0 {
+		req.Header.Set(lp.config.TenantKey, lp.config.TenantValue)
+	}
 	req.WithContext(lp.ctx)
 
 	if lp.config.Username != "" && lp.config.Password != "" {
